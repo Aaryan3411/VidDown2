@@ -1,0 +1,76 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Android Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java Development Kit (JDK)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.x'
+          channel: 'stable'
+          cache: true
+
+      - name: Setup Android Scaffolding & Gradle Wrapper
+        working-directory: ./mobile_app
+        run: |
+          # Generate complete native Android wrapper, gradle files, and build configs
+          flutter create --platforms=android --org com.viddown .
+          
+          # Ensure network & storage permissions are declared in AndroidManifest
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+            sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>' "$MANIFEST"
+          fi
+          sed -i 's/<application/<application android:requestLegacyExternalStorage="true"/' "$MANIFEST"
+
+          # Ensure minSdkVersion is at least 21 for flutter_inappwebview
+          GRADLE="android/app/build.gradle"
+          if [ -f "$GRADLE" ]; then
+            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 21/' "$GRADLE"
+            sed -i 's/minSdkVersion = flutter.minSdkVersion/minSdkVersion = 21/' "$GRADLE"
+          fi
+
+      - name: Get dependencies
+        working-directory: ./mobile_app
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: ./mobile_app
+        run: flutter build apk --release --no-tree-shake-icons
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: viddown-mobile-release-apk
+          path: mobile_app/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Create GitHub Release
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mobile_app/build/app/outputs/flutter-apk/app-release.apk
+          tag_name: v1.0.${{ github.run_number }}
+          name: "VidDown Mobile APK v1.0.${{ github.run_number }}"
+          body: "Automated Android release build for VidDown Mobile App. Download app-release.apk and install on your phone."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

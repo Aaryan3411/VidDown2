@@ -1,0 +1,8 @@
+{
+  "name": "Remix Video URL Downloader",
+  "description": "Fast and versatile web application to inspect, preview, and download videos directly from any URL with custom naming and format detection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
