@@ -116,8 +116,12 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
   bool _isLoadingPage = false;
   String _currentTitle = 'Browser';
 
-  // Detected media items on the current page
-  final List<DetectedVideo> _detectedVideos = [];
+  // Single active on-screen video detected
+  DetectedVideo? _onScreenVideo;
+
+  // Recent video stream URLs captured from network (ring buffer, max 20)
+  final List<String> _recentStreamUrls = [];
+  DateTime _lastDetectTime = DateTime.now();
 
   // Active Download State
   bool _isDownloading = false;
@@ -179,6 +183,7 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
   }
 
   void _checkForVideoUrl(String rawUrl) {
+    if (rawUrl.startsWith('data:') || rawUrl.startsWith('blob:')) return;
     final lower = rawUrl.toLowerCase();
     
     // Check if network request is a video stream/asset
@@ -187,63 +192,183 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
         lower.contains('.m4v') ||
         lower.contains('.mov') ||
         lower.contains('.m3u8') ||
-        lower.contains('.mp3') ||
         lower.contains('video/mp4') ||
-        lower.contains('mime=video');
+        lower.contains('mime=video') ||
+        lower.contains('&bytestart=');
 
     if (isVideoFile) {
-      if (!_detectedVideos.any((v) => v.url == rawUrl)) {
+      if (!_recentStreamUrls.contains(rawUrl)) {
+        _recentStreamUrls.insert(0, rawUrl);
+        if (_recentStreamUrls.length > 20) {
+          _recentStreamUrls.removeLast();
+        }
+      }
+      _scheduleOnScreenDetection();
+    }
+  }
+
+  void _scheduleOnScreenDetection() {
+    final now = DateTime.now();
+    if (now.difference(_lastDetectTime).inMilliseconds > 350) {
+      _lastDetectTime = now;
+      _detectOnScreenVideo();
+    }
+  }
+
+  // Sniff and identify the SINGLE ON-SCREEN video (visible in viewport or currently playing)
+  Future<DetectedVideo?> _detectOnScreenVideo({bool silent = true}) async {
+    if (_webViewController == null) return null;
+
+    try {
+      final jsResult = await _webViewController!.evaluateJavascript(source: """
+        (function() {
+          try {
+            var winHeight = window.innerHeight || document.documentElement.clientHeight;
+            var winWidth = window.innerWidth || document.documentElement.clientWidth;
+            var screenCenterY = winHeight / 2;
+
+            var videos = Array.from(document.querySelectorAll('video'));
+            if (!videos || videos.length === 0) {
+              return null;
+            }
+
+            var bestVideo = null;
+            var bestScore = -999999999;
+
+            for (var i = 0; i < videos.length; i++) {
+              var v = videos[i];
+              var rect = v.getBoundingClientRect();
+
+              // Check if visible within viewport bounds
+              var visibleTop = Math.max(rect.top, 0);
+              var visibleBottom = Math.min(rect.bottom, winHeight);
+              var visibleHeight = Math.max(0, visibleBottom - visibleTop);
+              var visibleLeft = Math.max(rect.left, 0);
+              var visibleRight = Math.min(rect.right, winWidth);
+              var visibleWidth = Math.max(0, visibleRight - visibleLeft);
+              var visibleArea = visibleHeight * visibleWidth;
+
+              // Ignore zero or microscopic sizes
+              if (rect.width <= 15 || rect.height <= 15) continue;
+
+              var centerY = rect.top + (rect.height / 2);
+              var distToCenter = Math.abs(centerY - screenCenterY);
+
+              // Playing state
+              var isPlaying = (!v.paused && !v.ended && v.readyState > 1);
+
+              // Score calculation:
+              // 1. Currently playing video gets massive boost (+500,000)
+              // 2. Video closest to vertical center of screen (+10,000 - dist)
+              // 3. Visible area in viewport
+              var isVisible = (visibleHeight > 30 && visibleWidth > 30);
+              var score = (isPlaying ? 500000 : 0) + (10000 - distToCenter) + (visibleArea / 100);
+
+              if ((isVisible || isPlaying) && score > bestScore) {
+                bestScore = score;
+                bestVideo = v;
+              }
+            }
+
+            if (!bestVideo) {
+              bestVideo = videos[0];
+            }
+            if (!bestVideo) return null;
+
+            // Direct video source candidates
+            var src = bestVideo.currentSrc || bestVideo.src;
+            if (!src || src.startsWith('blob:')) {
+              var sourceEl = bestVideo.querySelector('source');
+              if (sourceEl && sourceEl.src && !sourceEl.src.startsWith('blob:')) {
+                src = sourceEl.src;
+              }
+            }
+            if (!src || src.startsWith('blob:')) {
+              var attr = bestVideo.getAttribute('src') || bestVideo.getAttribute('data-src') || bestVideo.getAttribute('data-video-url');
+              if (attr && !attr.startsWith('blob:')) {
+                src = attr;
+              }
+            }
+
+            // Extract creator / account name & caption from surrounding post container (Instagram, TikTok, Twitter, Facebook, etc.)
+            var title = '';
+            var container = bestVideo.closest('article') || bestVideo.closest('div[role="dialog"]') || bestVideo.parentElement;
+            if (container) {
+              var authorEl = container.querySelector('header a, a[role="link"][tabindex="0"]');
+              var author = authorEl ? (authorEl.innerText || authorEl.textContent || '').trim() : '';
+
+              var captionEl = container.querySelector('h1, span[dir="auto"]');
+              var caption = captionEl ? (captionEl.innerText || captionEl.textContent || '').trim() : '';
+
+              if (author && caption) {
+                title = author + ': ' + caption.substring(0, 60);
+              } else if (author) {
+                title = author + ' Video';
+              } else if (caption) {
+                title = caption.substring(0, 60);
+              }
+            }
+
+            if (!title) {
+              title = bestVideo.getAttribute('title') || bestVideo.getAttribute('aria-label') || document.title || 'Onscreen Video';
+            }
+
+            title = title.replace(/[\\r\\n\\t]+/g, ' ').trim();
+            if (title.length > 70) title = title.substring(0, 67) + '...';
+
+            return {
+              src: src || '',
+              title: title,
+              isPlaying: (!bestVideo.paused && !bestVideo.ended)
+            };
+          } catch(e) {
+            return null;
+          }
+        })();
+      """);
+
+      String videoUrl = '';
+      String videoTitle = _currentTitle.isNotEmpty ? _currentTitle : 'Onscreen Video';
+
+      if (jsResult != null && jsResult is Map) {
+        final jsSrc = jsResult['src'] as String?;
+        final jsTitle = jsResult['title'] as String?;
+        if (jsTitle != null && jsTitle.trim().isNotEmpty) {
+          videoTitle = jsTitle.trim();
+        }
+        if (jsSrc != null && jsSrc.startsWith('http')) {
+          videoUrl = jsSrc;
+        }
+      }
+
+      // If DOM src was empty or blob, use the most recent intercepted stream URL
+      if (videoUrl.isEmpty && _recentStreamUrls.isNotEmpty) {
+        videoUrl = _recentStreamUrls.first;
+      }
+
+      if (videoUrl.isNotEmpty) {
         String ext = 'mp4';
+        final lower = videoUrl.toLowerCase();
         if (lower.contains('.webm')) ext = 'webm';
         if (lower.contains('.mov')) ext = 'mov';
         if (lower.contains('.mp3')) ext = 'mp3';
 
-        setState(() {
-          _detectedVideos.add(
-            DetectedVideo(
-              url: rawUrl,
-              title: _currentTitle.isNotEmpty ? _currentTitle : 'Captured Media',
-              ext: ext,
-            ),
-          );
-        });
-      }
-    }
-  }
+        final detected = DetectedVideo(
+          url: videoUrl,
+          title: videoTitle,
+          ext: ext,
+        );
 
-  // Sniff DOM video tags directly inside the webpage
-  Future<void> _sniffPageDomVideos() async {
-    if (_webViewController == null) return;
-
-    try {
-      final result = await _webViewController!.evaluateJavascript(source: """
-        (function() {
-          var urls = [];
-          // Check video tags
-          var vids = document.querySelectorAll('video');
-          for (var i = 0; i < vids.length; i++) {
-            if (vids[i].src && vids[i].src.length > 5) {
-              urls.push(vids[i].src);
-            }
-            var sources = vids[i].querySelectorAll('source');
-            for (var j = 0; j < sources.length; j++) {
-              if (sources[j].src && sources[j].src.length > 5) {
-                urls.push(sources[j].src);
-              }
-            }
-          }
-          return urls;
-        })();
-      """);
-
-      if (result != null && result is List) {
-        for (var raw in result) {
-          if (raw is String && raw.startsWith('http')) {
-            _checkForVideoUrl(raw);
-          }
+        if (mounted) {
+          setState(() {
+            _onScreenVideo = detected;
+          });
         }
+        return detected;
       }
     } catch (_) {}
+
+    return null;
   }
 
   Future<bool> _requestStoragePermissions() async {
@@ -273,7 +398,7 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
     return dir ?? (await getApplicationDocumentsDirectory());
   }
 
-  Future<void> _startDirectDownload(DetectedVideo video) async {
+  Future<void> _startDirectDownload(DetectedVideo video, {bool audioOnly = false}) async {
     final hasPermission = await _requestStoragePermissions();
     if (!hasPermission) {
       _showSnackbar('Storage permission is required to save downloads.');
@@ -290,14 +415,24 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
       final saveDir = await _getDownloadDirectory();
       final cleanTitle = video.title
           .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
+          .replaceAll(RegExp(r'\s+'), ' ')
           .trim();
-      final fileName = '${cleanTitle}_${DateTime.now().millisecondsSinceEpoch}.${video.ext}';
+      final safeTitle = cleanTitle.isNotEmpty ? cleanTitle : 'video_${DateTime.now().millisecondsSinceEpoch}';
+      final fileExt = audioOnly ? 'mp3' : video.ext;
+      final fileName = '${safeTitle}_${DateTime.now().millisecondsSinceEpoch % 100000}.$fileExt';
       final file = File('${saveDir.path}/$fileName');
 
       final dio = Dio();
       await dio.download(
         video.url,
         file.path,
+        options: Options(
+          headers: {
+            'User-Agent':
+                'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+            'Referer': _urlBarController.text.isNotEmpty ? _urlBarController.text : 'https://www.instagram.com/',
+          },
+        ),
         onReceiveProgress: (received, total) {
           if (total > 0) {
             setState(() {
@@ -653,7 +788,7 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
     );
   }
 
-  void _showDetectedMediaModal() {
+  void _showOnScreenVideoModal(DetectedVideo video) {
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF1E293B),
@@ -661,79 +796,175 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (ctx) {
-        return Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(
-                    'Found Videos (${_detectedVideos.length})',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF22C55E).withOpacity(0.2),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: const Icon(Icons.videocam_rounded, color: Color(0xFF22C55E), size: 24),
+                        ),
+                        const SizedBox(width: 12),
+                        const Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'On-Screen Video Detected',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            Text(
+                              'Single video ready for download',
+                              style: TextStyle(
+                                color: Color(0xFF94A3B8),
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
                     ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white70),
+                      onPressed: () => Navigator.pop(ctx),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                const Divider(color: Color(0xFF334155), height: 1),
+                const SizedBox(height: 14),
+
+                // Single focused Card for the on-screen video
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F172A),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: const Color(0xFF334155)),
                   ),
-                  IconButton(
-                    icon: const Icon(Icons.close, color: Colors.white70),
-                    onPressed: () => Navigator.pop(ctx),
-                  ),
-                ],
-              ),
-              const Divider(color: Color(0xFF334155)),
-              const SizedBox(height: 8),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 300),
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: _detectedVideos.length,
-                  itemBuilder: (ctx, i) {
-                    final item = _detectedVideos[i];
-                    return Card(
-                      color: const Color(0xFF0F172A),
-                      margin: const EdgeInsets.only(bottom: 8),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        side: const BorderSide(color: Color(0xFF334155)),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF2563EB).withOpacity(0.2),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: const Icon(Icons.play_circle_fill, color: Color(0xFF38BDF8), size: 28),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  video.title,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Row(
+                                  children: [
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFF1E293B),
+                                        borderRadius: BorderRadius.circular(4),
+                                        border: Border.all(color: const Color(0xFF475569)),
+                                      ),
+                                      child: Text(
+                                        video.ext.toUpperCase(),
+                                        style: const TextStyle(
+                                          color: Color(0xFF38BDF8),
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    const Text(
+                                      'Active On-Screen Video',
+                                      style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
                       ),
-                      child: ListTile(
-                        leading: const CircleAvatar(
-                          backgroundColor: Color(0xFF2563EB),
-                          child: Icon(Icons.play_arrow, color: Colors.white),
-                        ),
-                        title: Text(
-                          item.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
-                        ),
-                        subtitle: Text(
-                          'Format: ${item.ext.toUpperCase()}',
-                          style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
-                        ),
-                        trailing: ElevatedButton.icon(
+                      const SizedBox(height: 16),
+                      // Download Option 1: Video (MP4)
+                      SizedBox(
+                        width: double.infinity,
+                        height: 48,
+                        child: ElevatedButton.icon(
                           onPressed: () {
                             Navigator.pop(ctx);
-                            _startDirectDownload(item);
+                            _startDirectDownload(video);
                           },
-                          icon: const Icon(Icons.download, size: 16),
-                          label: const Text('Download'),
+                          icon: const Icon(Icons.download, color: Colors.white, size: 20),
+                          label: const Text(
+                            'Download Video (MP4)',
+                            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15),
+                          ),
                           style: ElevatedButton.styleFrom(
                             backgroundColor: const Color(0xFF22C55E),
                             foregroundColor: Colors.white,
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                            elevation: 2,
                           ),
                         ),
                       ),
-                    );
-                  },
+                      const SizedBox(height: 8),
+                      // Download Option 2: Audio Only (MP3)
+                      SizedBox(
+                        width: double.infinity,
+                        height: 42,
+                        child: OutlinedButton.icon(
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            _startDirectDownload(video, audioOnly: true);
+                          },
+                          icon: const Icon(Icons.music_note, color: Color(0xFF38BDF8), size: 18),
+                          label: const Text(
+                            'Download Audio Only (MP3)',
+                            style: TextStyle(color: Color(0xFF38BDF8), fontWeight: FontWeight.w600, fontSize: 13),
+                          ),
+                          style: OutlinedButton.styleFrom(
+                            side: const BorderSide(color: Color(0xFF334155)),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         );
       },
@@ -817,7 +1048,8 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
                   onLoadStart: (controller, url) {
                     setState(() {
                       _isLoadingPage = true;
-                      _detectedVideos.clear();
+                      _onScreenVideo = null;
+                      _recentStreamUrls.clear();
                       if (url != null) {
                         final strUrl = url.toString();
                         _urlBarController.text = strUrl;
@@ -839,6 +1071,9 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
                       _pageLoadingProgress = progress / 100;
                     });
                   },
+                  onScrollChanged: (controller, x, y) {
+                    _scheduleOnScreenDetection();
+                  },
                   onLoadStop: (controller, url) async {
                     setState(() {
                       _isLoadingPage = false;
@@ -856,7 +1091,7 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
                         _activeYouTubeVideoId = extractYouTubeId(strUrl);
                       });
                     }
-                    _sniffPageDomVideos();
+                    _detectOnScreenVideo();
                   },
                   shouldInterceptRequest: (controller, request) async {
                     final raw = request.url.toString();
@@ -899,7 +1134,7 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
           ),
 
           // Floating Download Button (Near the video / On bottom right)
-          if (_detectedVideos.isNotEmpty || isYouTubePage)
+          if (_onScreenVideo != null || _recentStreamUrls.isNotEmpty || isYouTubePage)
             Positioned(
               bottom: _isDownloading ? 80 : 24,
               right: 20,
@@ -908,11 +1143,11 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
                 elevation: 6,
                 icon: const Icon(Icons.download, color: Colors.white),
                 label: Text(
-                  (_activeYouTubeVideoId != null || extractYouTubeId(_urlBarController.text) != null)
-                      ? 'Download YouTube Media'
-                      : isYouTubePage
-                          ? 'Play Video to Download'
-                          : 'Download Video (${_detectedVideos.length})',
+                  isYouTubePage
+                      ? ((_activeYouTubeVideoId != null || extractYouTubeId(_urlBarController.text) != null)
+                          ? 'Download YouTube Media'
+                          : 'Play Video to Download')
+                      : 'Download Video',
                   style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
                 ),
                 onPressed: () async {
@@ -924,7 +1159,21 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
                     }
                     _showYouTubeFormatModal(videoId);
                   } else {
-                    _showDetectedMediaModal();
+                    final activeVideo = await _detectOnScreenVideo(silent: false);
+                    final target = activeVideo ?? _onScreenVideo;
+
+                    if (target != null) {
+                      _showOnScreenVideoModal(target);
+                    } else if (_recentStreamUrls.isNotEmpty) {
+                      final fallback = DetectedVideo(
+                        url: _recentStreamUrls.first,
+                        title: _currentTitle.isNotEmpty ? _currentTitle : 'Onscreen Video',
+                        ext: 'mp4',
+                      );
+                      _showOnScreenVideoModal(fallback);
+                    } else {
+                      _showSnackbar('No video is currently visible on screen. Please scroll to or play a video.');
+                    }
                   }
                 },
               ),
