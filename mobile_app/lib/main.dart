@@ -51,6 +51,56 @@ class DetectedVideo {
   });
 }
 
+// Robust YouTube Video ID extractor supporting all YouTube URL formats and shorts
+String? extractYouTubeId(String rawUrl) {
+  final trimmed = rawUrl.trim();
+  if (trimmed.isEmpty) return null;
+
+  // Direct 11-char ID
+  if (RegExp(r'^[a-zA-Z0-9_-]{11}$').hasMatch(trimmed)) {
+    return trimmed;
+  }
+
+  try {
+    final uri = Uri.parse(trimmed);
+
+    // 1. Check 'v' query parameter (e.g. youtube.com/watch?v=xxx)
+    final v = uri.queryParameters['v'];
+    if (v != null && RegExp(r'^[a-zA-Z0-9_-]{11}$').hasMatch(v)) {
+      return v;
+    }
+
+    // 2. Path segments: shorts/ID, embed/ID, live/ID, v/ID
+    final segments = uri.pathSegments;
+    for (int i = 0; i < segments.length; i++) {
+      final seg = segments[i].toLowerCase();
+      if (seg == 'shorts' || seg == 'embed' || seg == 'v' || seg == 'live') {
+        if (i + 1 < segments.length && RegExp(r'^[a-zA-Z0-9_-]{11}$').hasMatch(segments[i + 1])) {
+          return segments[i + 1];
+        }
+      }
+    }
+
+    // youtu.be/ID
+    if (uri.host.contains('youtu.be') && segments.isNotEmpty) {
+      if (RegExp(r'^[a-zA-Z0-9_-]{11}$').hasMatch(segments.first)) {
+        return segments.first;
+      }
+    }
+
+    // Regex fallback for non-standard / escaped URLs
+    final regExp = RegExp(
+      r'(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/|live\/))([a-zA-Z0-9_-]{11})',
+      caseSensitive: false,
+    );
+    final match = regExp.firstMatch(trimmed);
+    if (match != null && match.groupCount >= 1) {
+      return match.group(1);
+    }
+  } catch (_) {}
+  return null;
+}
+
 class BrowserSnifferScreen extends StatefulWidget {
   const BrowserSnifferScreen({super.key});
 
@@ -73,6 +123,7 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
   bool _isDownloading = false;
   double _downloadProgress = 0.0;
   String _downloadStatus = '';
+  String? _activeYouTubeVideoId;
 
   final YoutubeExplode _yt = YoutubeExplode();
 
@@ -81,6 +132,32 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
     _urlBarController.dispose();
     _yt.close();
     super.dispose();
+  }
+
+  Future<String?> _resolveActiveYouTubeId() async {
+    if (_activeYouTubeVideoId != null && _activeYouTubeVideoId!.isNotEmpty) {
+      return _activeYouTubeVideoId;
+    }
+
+    if (_webViewController != null) {
+      try {
+        final uri = await _webViewController!.getUrl();
+        if (uri != null) {
+          final id = extractYouTubeId(uri.toString());
+          if (id != null) return id;
+        }
+      } catch (_) {}
+
+      try {
+        final jsUrl = await _webViewController!.evaluateJavascript(source: 'window.location.href');
+        if (jsUrl != null && jsUrl is String && jsUrl.isNotEmpty) {
+          final id = extractYouTubeId(jsUrl);
+          if (id != null) return id;
+        }
+      } catch (_) {}
+    }
+
+    return extractYouTubeId(_urlBarController.text);
   }
 
   void _navigateToUrl(String input) {
@@ -250,34 +327,224 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
     }
   }
 
-  Future<void> _startYouTubeDownload(String youtubeUrl) async {
+  void _showYouTubeFormatModal(String videoIdStr) {
+    final cleanId = extractYouTubeId(videoIdStr);
+    if (cleanId == null) {
+      _showSnackbar('Please tap and open a YouTube video first.');
+      return;
+    }
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1E293B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Colors.red.withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: const Icon(Icons.play_arrow_rounded, color: Colors.redAccent, size: 24),
+                    ),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Download YouTube Media',
+                            style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                          ),
+                          Text(
+                            'Select desired output format',
+                            style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white60),
+                      onPressed: () => Navigator.pop(ctx),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                const Divider(color: Color(0xFF334155), height: 1),
+                const SizedBox(height: 12),
+
+                // Option 1: Full Video MP4
+                Card(
+                  color: const Color(0xFF0F172A),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    side: const BorderSide(color: Color(0xFF334155)),
+                  ),
+                  child: ListTile(
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    leading: const CircleAvatar(
+                      backgroundColor: Color(0xFF2563EB),
+                      child: Icon(Icons.movie_creation_outlined, color: Colors.white, size: 20),
+                    ),
+                    title: const Text(
+                      'Download Video (MP4)',
+                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 14),
+                    ),
+                    subtitle: const Text(
+                      'Best available quality with combined audio',
+                      style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11),
+                    ),
+                    trailing: const Icon(Icons.arrow_forward_ios, color: Colors.white54, size: 14),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _startYouTubeDownload(cleanId, audioOnly: false);
+                    },
+                  ),
+                ),
+                const SizedBox(height: 8),
+
+                // Option 2: Audio Only MP3/M4A
+                Card(
+                  color: const Color(0xFF0F172A),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    side: const BorderSide(color: Color(0xFF334155)),
+                  ),
+                  child: ListTile(
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    leading: const CircleAvatar(
+                      backgroundColor: Color(0xFF10B981),
+                      child: Icon(Icons.music_note_rounded, color: Colors.white, size: 20),
+                    ),
+                    title: const Text(
+                      'Download Audio Only (Music / MP3)',
+                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 14),
+                    ),
+                    subtitle: const Text(
+                      'High bitrate sound track for offline music player',
+                      style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11),
+                    ),
+                    trailing: const Icon(Icons.arrow_forward_ios, color: Colors.white54, size: 14),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _startYouTubeDownload(cleanId, audioOnly: true);
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _startYouTubeDownload(String rawIdOrUrl, {bool audioOnly = false}) async {
+    final cleanId = extractYouTubeId(rawIdOrUrl);
+    if (cleanId == null) {
+      _showSnackbar('Please open a YouTube video first to download.');
+      return;
+    }
+
     final hasPermission = await _requestStoragePermissions();
     if (!hasPermission) {
-      _showSnackbar('Storage permission is required.');
+      _showSnackbar('Storage permission is required to save downloads.');
       return;
     }
 
     setState(() {
       _isDownloading = true;
       _downloadProgress = 0.0;
-      _downloadStatus = 'Parsing YouTube streams...';
+      _downloadStatus = 'Connecting to YouTube...';
     });
 
+    YoutubeExplode yt = YoutubeExplode();
+    IOSink? output;
+
     try {
-      final videoId = VideoId(youtubeUrl);
-      final video = await _yt.videos.get(videoId);
-      final manifest = await _yt.videos.streamsClient.getManifest(videoId);
-      final muxed = manifest.muxed.withHighestBitrate();
+      final videoId = VideoId(cleanId);
+
+      setState(() {
+        _downloadStatus = 'Fetching video information...';
+      });
+      final video = await yt.videos.get(videoId);
+
+      setState(() {
+        _downloadStatus = 'Parsing stream manifest...';
+      });
+      final manifest = await yt.videos.streamsClient.getManifest(videoId);
+
+      StreamInfo? selectedStream;
+      String fileExt = 'mp4';
+
+      if (audioOnly) {
+        if (manifest.audioOnly.isNotEmpty) {
+          selectedStream = manifest.audioOnly.withHighestBitrate();
+          fileExt = selectedStream.container.name;
+        } else if (manifest.audio.isNotEmpty) {
+          selectedStream = manifest.audio.withHighestBitrate();
+          fileExt = 'mp3';
+        }
+      } else {
+        // Preferred order for video:
+        // 1. Muxed streams (both video & audio combined)
+        if (manifest.muxed.isNotEmpty) {
+          try {
+            selectedStream = manifest.muxed.withHighestBitrate();
+            fileExt = 'mp4';
+          } catch (_) {}
+        }
+
+        // 2. High-res video stream fallback
+        if (selectedStream == null && manifest.video.isNotEmpty) {
+          try {
+            selectedStream = manifest.video.withHighestBitrate();
+            fileExt = selectedStream.container.name;
+          } catch (_) {}
+        }
+
+        // 3. Audio stream fallback
+        if (selectedStream == null && manifest.audioOnly.isNotEmpty) {
+          try {
+            selectedStream = manifest.audioOnly.withHighestBitrate();
+            fileExt = 'mp3';
+          } catch (_) {}
+        }
+      }
+
+      if (selectedStream == null) {
+        throw Exception('No playable video or audio streams found for this video.');
+      }
 
       final saveDir = await _getDownloadDirectory();
-      final cleanTitle = video.title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
-      final file = File('${saveDir.path}/$cleanTitle.mp4');
+      final cleanTitle = video.title
+          .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+      final safeTitle = cleanTitle.isNotEmpty ? cleanTitle : 'youtube_${videoId.value}';
+      final file = File('${saveDir.path}/$safeTitle.$fileExt');
 
-      final totalBytes = muxed.size.totalBytes;
+      final totalBytes = selectedStream.size.totalBytes;
       int downloadedBytes = 0;
 
-      final stream = _yt.videos.streamsClient.get(muxed);
-      final output = file.openWrite();
+      setState(() {
+        _downloadStatus =
+            'Downloading ${audioOnly ? "Audio" : (selectedStream?.qualityLabel ?? fileExt.toUpperCase())}...';
+      });
+
+      final stream = yt.videos.streamsClient.get(selectedStream);
+      output = file.openWrite();
 
       await for (final chunk in stream) {
         output.add(chunk);
@@ -293,6 +560,7 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
 
       await output.flush();
       await output.close();
+      output = null;
 
       setState(() {
         _isDownloading = false;
@@ -301,10 +569,26 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
 
       _showSuccessDialog(file.path, video.title);
     } catch (e) {
+      if (output != null) {
+        try {
+          await output.close();
+        } catch (_) {}
+      }
       setState(() {
         _isDownloading = false;
       });
-      _showSnackbar('YouTube stream error: $e');
+
+      String userMsg = e.toString();
+      if (userMsg.contains('Invalid argument')) {
+        userMsg = 'Invalid YouTube video ID or stream format. Please select another video.';
+      } else if (userMsg.contains('VideoUnplayableException')) {
+        userMsg = 'This video is private, age-restricted, or blocked by copyright in this region.';
+      } else if (userMsg.contains('SocketException')) {
+        userMsg = 'Network connection interrupted. Please check your internet connection.';
+      }
+      _showSnackbar('Download note: $userMsg');
+    } finally {
+      yt.close();
     }
   }
 
@@ -535,9 +819,20 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
                       _isLoadingPage = true;
                       _detectedVideos.clear();
                       if (url != null) {
-                        _urlBarController.text = url.toString();
+                        final strUrl = url.toString();
+                        _urlBarController.text = strUrl;
+                        _activeYouTubeVideoId = extractYouTubeId(strUrl);
                       }
                     });
+                  },
+                  onUpdateVisitedHistory: (controller, url, isReload) {
+                    if (url != null) {
+                      final strUrl = url.toString();
+                      setState(() {
+                        _urlBarController.text = strUrl;
+                        _activeYouTubeVideoId = extractYouTubeId(strUrl);
+                      });
+                    }
                   },
                   onProgressChanged: (controller, progress) {
                     setState(() {
@@ -549,9 +844,16 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
                       _isLoadingPage = false;
                     });
                     final title = await controller.getTitle();
-                    if (title != null) {
+                    if (title != null && title.isNotEmpty) {
                       setState(() {
                         _currentTitle = title;
+                      });
+                    }
+                    if (url != null) {
+                      final strUrl = url.toString();
+                      setState(() {
+                        _urlBarController.text = strUrl;
+                        _activeYouTubeVideoId = extractYouTubeId(strUrl);
                       });
                     }
                     _sniffPageDomVideos();
@@ -606,14 +908,21 @@ class _BrowserSnifferScreenState extends State<BrowserSnifferScreen> {
                 elevation: 6,
                 icon: const Icon(Icons.download, color: Colors.white),
                 label: Text(
-                  isYouTubePage
-                      ? 'Download YouTube Video'
-                      : 'Download Video (${_detectedVideos.length})',
+                  (_activeYouTubeVideoId != null || extractYouTubeId(_urlBarController.text) != null)
+                      ? 'Download YouTube Media'
+                      : isYouTubePage
+                          ? 'Play Video to Download'
+                          : 'Download Video (${_detectedVideos.length})',
                   style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
                 ),
-                onPressed: () {
+                onPressed: () async {
                   if (isYouTubePage) {
-                    _startYouTubeDownload(_urlBarController.text);
+                    final videoId = await _resolveActiveYouTubeId();
+                    if (videoId == null) {
+                      _showSnackbar('Please tap and open any YouTube video first before downloading.');
+                      return;
+                    }
+                    _showYouTubeFormatModal(videoId);
                   } else {
                     _showDetectedMediaModal();
                   }
